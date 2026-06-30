@@ -20,9 +20,9 @@ BARS_FOR_TRAINING  = 5000           # approx 3.5 days of 1-min bars
 
 # ── Signal / Prediction ──────────────────────────────────────────────────────
 PREDICT_HORIZON    = 5              # Predict price direction in N minutes
-BUY_THRESHOLD      = 0.58           # Model prob > 58% → BUY
-SELL_THRESHOLD     = 0.42           # Model prob < 42% → SELL
-                                    # 42%-58% → HOLD (not enough conviction)
+BUY_THRESHOLD      = 0.52           # Model prob > 52% → BUY  (loosened from 58%)
+SELL_THRESHOLD     = 0.48           # Model prob < 48% → SELL (loosened from 42%)
+                                    # 48%-52% → HOLD (tight band to avoid noise)
 
 # ── Model Retraining ─────────────────────────────────────────────────────────
 RETRAIN_EVERY_MINS = 240            # Retrain XGBoost every 4 hours
@@ -37,8 +37,8 @@ MAX_DAILY_LOSS_PCT = 0.05           # Stop trading if daily loss > 5% of equity
 # ── Regime-Aware Position Sizing (from daily HMM) ────────────────────────────
 REGIME_MULTIPLIERS = {
     'BULL':   1.00,
-    'CHOPPY': 0.50,
-    'PANIC':  0.25,
+    'CHOPPY': 0.60,   # raised from 0.50
+    'PANIC':  0.40,   # raised from 0.25 — still cautious but allows trades
 }
 
 # ── WTI Market Hours (UTC) ───────────────────────────────────────────────────

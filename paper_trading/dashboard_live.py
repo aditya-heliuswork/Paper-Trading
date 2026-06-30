@@ -92,29 +92,29 @@ class LiveDashboard:
         summary   = self.trade_log.get_summary()
         snap_port = self.portfolio.get_snapshot(current_price) if self.portfolio else {}
 
-        # ── Build subplot grid ───────────────────────────────────────────────
+        # ── Build subplot grid (9 chart panels; table is separate) ─────────────
         fig = make_subplots(
             rows=5, cols=2,
             subplot_titles=[
-                '📈 Portfolio Equity Curve',
-                '🛢️ WTI 1-Min Price + Signals',
-                '📊 Per-Trade P&L',
-                '🌡️ Market Regime Timeline',
-                '🎯 Model Confidence (Probability)',
-                '📋 Trade Log (Last 50)',
-                '🏆 Win / Loss Distribution',
-                '💡 Feature Importance',
-                '⚡ Realized P&L Over Time',
-                '📉 Drawdown Chart',
+                'Portfolio Equity Curve',
+                'WTI 1-Min Price + Signals',
+                'Per-Trade P&L',
+                'Market Regime Timeline',
+                'Model Confidence (Probability)',
+                'Rolling Win Rate',
+                'Win / Loss Distribution',
+                'Feature Importance',
+                'Realized P&L Over Time',
+                'Drawdown Chart',
             ],
             vertical_spacing=0.08,
             horizontal_spacing=0.06,
             specs=[
-                [{"type": "scatter"}, {"type": "scatter"}],
-                [{"type": "bar"},     {"type": "scatter"}],
-                [{"type": "scatter"}, {"type": "domain"}],
+                [{"type": "scatter"},   {"type": "scatter"}],
+                [{"type": "bar"},       {"type": "scatter"}],
+                [{"type": "scatter"},   {"type": "scatter"}],
                 [{"type": "histogram"}, {"type": "bar"}],
-                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"},   {"type": "scatter"}],
             ]
         )
 
@@ -133,8 +133,8 @@ class LiveDashboard:
         # ── Panel 5: Model Confidence ─────────────────────────────────────────
         self._add_confidence_chart(fig, snapshots, row=3, col=1)
 
-        # ── Panel 6: Trade Log Table ──────────────────────────────────────────
-        self._add_trade_table(fig, trades, row=3, col=2)
+        # ── Panel 6: Rolling Win Rate ─────────────────────────────────────────
+        self._add_rolling_winrate(fig, trades, row=3, col=2)
 
         # ── Panel 7: Win/Loss Histogram ───────────────────────────────────────
         self._add_win_loss_hist(fig, trades, row=4, col=1)
@@ -148,10 +148,13 @@ class LiveDashboard:
         # ── Panel 10: Drawdown ────────────────────────────────────────────────
         self._add_drawdown(fig, snapshots, row=5, col=2)
 
+        # ── Standalone Trade Table figure ─────────────────────────────────────
+        table_html = self._build_trade_table_html(trades)
+
         # ── Layout ───────────────────────────────────────────────────────────
         fig.update_layout(
             title=dict(
-                text=f'🛢️ PetroQuant Paper Trading Dashboard  |  WTI ${current_price:.2f}  |  '
+                text=f'PetroQuant Paper Trader  |  WTI ${current_price:.2f}  |  '
                      f'Regime: {regime}  |  '
                      f'Updated: {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}',
                 font=dict(size=16, color=COLORS['text_primary']),
@@ -161,19 +164,19 @@ class LiveDashboard:
             plot_bgcolor=COLORS['bg_panel'],
             font=dict(family='Inter, system-ui, sans-serif',
                       size=11, color=COLORS['text_primary']),
-            height=2000,
+            height=2200,
             showlegend=True,
             legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=10)),
         )
 
-        # Apply dark grid styling to all axes
+        # Apply dark grid styling to all xy-axes (skip domain/table types)
         fig.update_xaxes(gridcolor=COLORS['grid'], zerolinecolor=COLORS['grid'],
                          showgrid=True, linecolor=COLORS['grid'])
         fig.update_yaxes(gridcolor=COLORS['grid'], zerolinecolor=COLORS['grid'],
                          showgrid=True, linecolor=COLORS['grid'])
 
         # ── Generate HTML with auto-refresh ───────────────────────────────────
-        html = self._wrap_html(fig, summary, snap_port, model_status, regime, current_price)
+        html = self._wrap_html(fig, table_html, summary, snap_port, model_status, regime, current_price)
         return html
 
     # ── Save ─────────────────────────────────────────────────────────────────
@@ -312,40 +315,81 @@ class LiveDashboard:
         fig.add_hline(y=0.5, line_dash='dot', line_color=COLORS['text_muted'],
                       opacity=0.4, row=row, col=col)
 
-    def _add_trade_table(self, fig, trades, row, col):
+    def _add_rolling_winrate(self, fig, trades, row, col):
+        """Rolling 20-trade win rate line chart."""
+        closes = trades[trades['action'].str.startswith('CLOSE', na=False)].copy()
+        if len(closes) < 5:
+            return
+        closes = closes.sort_values('timestamp')
+        closes['win'] = (closes['pnl_realized'] > 0).astype(float)
+        closes['rolling_wr'] = closes['win'].rolling(min(20, len(closes))).mean() * 100
+        fig.add_trace(go.Scatter(
+            x=pd.to_datetime(closes['timestamp']),
+            y=closes['rolling_wr'],
+            name='Rolling Win Rate %',
+            line=dict(color=COLORS['accent_gold'], width=2),
+            fill='tozeroy',
+            fillcolor='rgba(210, 153, 34, 0.08)',
+        ), row=row, col=col)
+        fig.add_hline(y=50, line_dash='dot', line_color=COLORS['text_muted'],
+                      opacity=0.5, row=row, col=col)
+
+    def _build_trade_table_html(self, trades) -> str:
+        """Renders the recent trade log as a styled HTML table (no Plotly required)."""
         recent = trades[trades['action'].str.startswith('OPEN', na=False)].head(50)
         if recent.empty:
-            return
+            return '<p style="color:#8b949e;padding:16px">No trades yet.</p>'
         recent = recent.sort_values('timestamp', ascending=False)
 
         def _fmt_pnl(v):
             try:
-                return f'${float(v):+.2f}'
+                val = float(v)
+                color = '#2ea043' if val > 0 else ('#f85149' if val < 0 else '#8b949e')
+                return f'<span style="color:{color}">${val:+.2f}</span>'
             except Exception:
                 return str(v)
 
-        fig.add_trace(go.Table(
-            header=dict(
-                values=['Time', 'Action', 'Price', 'Qty', 'Regime', 'Prob', 'P&L'],
-                fill_color=COLORS['bg_card'],
-                font=dict(color=COLORS['text_primary'], size=11),
-                align='left',
-            ),
-            cells=dict(
-                values=[
-                    recent['timestamp'].dt.strftime('%m-%d %H:%M').tolist(),
-                    recent['action'].tolist(),
-                    [f'${p:.2f}' for p in recent['price'].fillna(0)],
-                    [f'{q:.3f}' for q in recent['quantity'].fillna(0)],
-                    recent['regime'].fillna('-').tolist(),
-                    [f'{p:.1%}' for p in recent['probability'].fillna(0.5)],
-                    [_fmt_pnl(p) for p in recent['pnl_realized'].fillna(0)],
-                ],
-                fill_color=[[COLORS['bg_panel'], COLORS['bg_card']] * 50],
-                font=dict(color=COLORS['text_primary'], size=10),
-                align='left',
-            ),
-        ), row=row, col=col)
+        rows_html = ''
+        for _, r in recent.iterrows():
+            ts = str(r.get('timestamp', ''))[:16]
+            action = r.get('action', '')
+            action_color = '#2ea043' if 'LONG' in str(action) else '#f85149'
+            price  = f"${float(r.get('price', 0)):.2f}"
+            qty    = f"{float(r.get('quantity', 0)):.3f}"
+            regime = r.get('regime', '-')
+            prob   = f"{float(r.get('probability', 0.5)):.1%}"
+            pnl    = _fmt_pnl(r.get('pnl_realized', 0))
+            rows_html += f"""
+            <tr>
+              <td>{ts}</td>
+              <td style="color:{action_color};font-weight:600">{action}</td>
+              <td>{price}</td><td>{qty}</td>
+              <td>{regime}</td><td>{prob}</td><td>{pnl}</td>
+            </tr>"""
+
+        return f"""
+        <div style="margin:24px 0;background:#161b22;border-radius:12px;
+                    border:1px solid #21262d;overflow:hidden">
+          <div style="padding:14px 20px;background:#1c2128;border-bottom:1px solid #21262d">
+            <span style="font-weight:600;font-size:14px">Trade Log (Last 50)</span>
+          </div>
+          <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="background:#1c2128;color:#8b949e">
+                <th style="padding:8px 12px;text-align:left">Time</th>
+                <th style="padding:8px 12px;text-align:left">Action</th>
+                <th style="padding:8px 12px;text-align:left">Price</th>
+                <th style="padding:8px 12px;text-align:left">Qty</th>
+                <th style="padding:8px 12px;text-align:left">Regime</th>
+                <th style="padding:8px 12px;text-align:left">Prob</th>
+                <th style="padding:8px 12px;text-align:left">P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody style="color:#e6edf3">{rows_html}</tbody>
+          </table>
+          </div>
+        </div>"""
 
     def _add_win_loss_hist(self, fig, trades, row, col):
         closes = trades[trades['action'].str.startswith('CLOSE', na=False)]
@@ -404,8 +448,8 @@ class LiveDashboard:
             fillcolor='rgba(248, 81, 73, 0.08)',
         ), row=row, col=col)
 
-    # ── HTML Wrapper ──────────────────────────────────────────────────────────
-    def _wrap_html(self, fig, summary, snap_port, model_status, regime, current_price) -> str:
+    # ── HTML Wrapper ───────────────────────────────────────────────────────────
+    def _wrap_html(self, fig, table_html: str, summary, snap_port, model_status, regime, current_price) -> str:
         """Wraps Plotly figure in a full HTML page with auto-refresh and status cards."""
         plot_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
 
@@ -537,8 +581,12 @@ class LiveDashboard:
   {plot_html}
 </div>
 
+<div style="padding: 0 24px 24px">
+  {table_html}
+</div>
+
 <div class="refresh-note">
-  📡 Auto-refreshes every {cfg.DASHBOARD_REFRESH} seconds &nbsp;|&nbsp;
+  Auto-refreshes every {cfg.DASHBOARD_REFRESH} seconds &nbsp;|&nbsp;
   <a href="/trades" style="color:#388bfd">Download Trade CSV</a> &nbsp;|&nbsp;
   <a href="/status" style="color:#388bfd">JSON Status</a>
 </div>
@@ -546,3 +594,4 @@ class LiveDashboard:
 </body>
 </html>"""
         return html
+
