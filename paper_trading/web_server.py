@@ -1,18 +1,21 @@
 # ============================================================================
 # PETROQUANT PAPER TRADING — FLASK WEB SERVER
 # ============================================================================
-# Serves the live dashboard and JSON API endpoints so you can monitor
-# the paper trader from any device (phone/laptop) while the engine runs
-# on a cloud server (Railway.app).
+# Serves the live dashboard and JSON API endpoints.
 #
 # Endpoints:
-#   GET /              → HTML dashboard (auto-refresh every 60s)
-#   GET /dashboard     → same as above
-#   GET /status        → JSON: current position, equity, last signal
-#   GET /trades        → CSV download: full trade log
-#   GET /trades/json   → JSON: last 100 trades
-#   GET /health        → {"status":"ok"} for uptime monitoring
-#   GET /reset         → ⚠ Reset all trades (protected by ?confirm=yes)
+#   GET  /               → HTML dashboard (auto-refresh every 60s)
+#   GET  /dashboard      → same as above
+#   GET  /status         → JSON: current position, equity, last signal, timeframe
+#   GET  /trades         → CSV download: full trade log
+#   GET  /trades/json    → JSON: last 100 trades
+#   GET  /health         → {"status":"ok"} for uptime monitoring
+#   POST /set-timeframe  → JSON body {"timeframe":"5m"} — switch trading timeframe
+#   GET  /reset          → confirmation page
+#   POST /reset          → reset all trades (body: confirm=yes)
+#
+# Bug #15 fix: current_price is passed as None (not 0) when the engine hasn't
+#   received a first tick yet — the dashboard handles None gracefully.
 # ============================================================================
 
 from flask import Flask, Response, request, jsonify, send_file
@@ -33,8 +36,6 @@ def create_web_server(engine_ref: dict) -> Flask:
       engine_ref['portfolio'] → Portfolio instance
       engine_ref['trade_log'] → TradeLog instance
       engine_ref['dashboard'] → LiveDashboard instance
-
-    Using a dict reference allows the web server to always see the latest state.
     """
     app = Flask(__name__, static_folder=None)
     app.logger.disabled = True
@@ -47,20 +48,15 @@ def create_web_server(engine_ref: dict) -> Flask:
     def dashboard():
         try:
             dash      = engine_ref.get('dashboard')
-            portfolio = engine_ref.get('portfolio')
             engine    = engine_ref.get('engine')
 
-            current_price = None
-            regime        = 'UNKNOWN'
-            model_status  = {}
-
-            if engine:
-                current_price = engine.last_price
-                regime        = engine.current_regime
-                model_status  = engine.model.get_model_status() if engine.model else {}
+            # Bug #15 fix: use None (not 0) when no price yet — dashboard renders "Connecting..."
+            current_price = engine.last_price if engine else None
+            regime        = engine.current_regime if engine else 'UNKNOWN'
+            model_status  = engine.model.get_model_status() if (engine and engine.model) else {}
 
             html = dash.render(
-                current_price=current_price or 0,
+                current_price=current_price,   # can be None — handled in dashboard
                 regime=regime,
                 model_status=model_status,
             )
@@ -74,28 +70,76 @@ def create_web_server(engine_ref: dict) -> Flask:
     @app.route('/status')
     def status():
         try:
-            engine     = engine_ref.get('engine')
-            # Always read through engine so state is current after any reset
-            portfolio  = engine.portfolio  if engine  else engine_ref.get('portfolio')
-            trade_log  = engine_ref.get('trade_log')
+            engine    = engine_ref.get('engine')
+            portfolio = engine.portfolio if engine else engine_ref.get('portfolio')
+            trade_log = engine_ref.get('trade_log')
 
             current_price = engine.last_price if engine else None
-            snap = portfolio.get_snapshot(current_price) if portfolio else {}
+            snap    = portfolio.get_snapshot(current_price) if portfolio else {}
             summary = trade_log.get_summary() if trade_log else {}
 
             return jsonify({
                 'status'        : 'running',
                 'current_price' : current_price,
                 'regime'        : engine.current_regime if engine else 'UNKNOWN',
-                'last_signal'   : engine.last_signal if engine else 'UNKNOWN',
-                'last_prob'     : engine.last_prob if engine else None,
+                'last_signal'   : engine.last_signal    if engine else 'UNKNOWN',
+                'last_prob'     : engine.last_prob       if engine else None,
+                'timeframe'     : cfg.ACTIVE_TIMEFRAME,
+                'loop_secs'     : cfg.LOOP_INTERVAL_SECS,
+                'predict_horizon': cfg.PREDICT_HORIZON,
                 'portfolio'     : snap,
                 'summary'       : summary,
-                'model'         : engine.model.get_model_status() if engine and engine.model else {},
+                'model'         : engine.model.get_model_status() if (engine and engine.model) else {},
                 'market_open'   : engine.is_market_open() if engine else False,
+                'uptime_secs'   : engine.uptime_seconds() if engine else 0,
             })
         except Exception as e:
             return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    # ── Set Timeframe (NEW endpoint) ──────────────────────────────────────────
+    @app.route('/set-timeframe', methods=['POST'])
+    def set_timeframe():
+        """
+        Switch the paper trader to a different timeframe at runtime.
+
+        Body: JSON {"timeframe": "5m"}
+        Valid values: 1m, 5m, 15m, 1h, 1d
+
+        The engine stops its loop, applies the new config, resets the model,
+        then restarts. Existing trades in the DB are preserved.
+        """
+        try:
+            data = request.get_json(silent=True) or {}
+            tf   = str(data.get('timeframe', '')).strip()
+
+            if not tf:
+                return jsonify({'error': 'timeframe is required',
+                                'valid': list(cfg.TIMEFRAME_CONFIGS.keys())}), 400
+
+            if tf not in cfg.TIMEFRAME_CONFIGS:
+                return jsonify({'error': f"Unknown timeframe '{tf}'",
+                                'valid': list(cfg.TIMEFRAME_CONFIGS.keys())}), 400
+
+            engine = engine_ref.get('engine')
+            if engine is None:
+                return jsonify({'error': 'Engine not available'}), 503
+
+            result = engine.switch_timeframe(tf)
+            logger.info(f"[WebServer] Timeframe switched to {tf} via API")
+
+            return jsonify({
+                'status'   : 'ok',
+                'timeframe': result['timeframe'],
+                'loop_secs': result['loop_secs'],
+                'horizon'  : result['horizon'],
+                'message'  : f"Switched to {cfg.get_timeframe_label(tf)} timeframe",
+            })
+
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error(f"[WebServer] set-timeframe error: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
 
     # ── Trade Log CSV ─────────────────────────────────────────────────────────
     @app.route('/trades')
@@ -128,13 +172,14 @@ def create_web_server(engine_ref: dict) -> Flask:
     def health():
         engine = engine_ref.get('engine')
         return jsonify({
-            'status'   : 'ok',
-            'version'  : '1.0.0',
-            'running'  : engine._running if engine else False,
-            'uptime_s' : engine.uptime_seconds() if engine else 0,
+            'status'    : 'ok',
+            'version'   : '1.1.0',
+            'running'   : engine._running if engine else False,
+            'uptime_s'  : engine.uptime_seconds() if engine else 0,
+            'timeframe' : cfg.ACTIVE_TIMEFRAME,
         })
 
-    # ── Reset (protected — POST only to prevent accidental/crawler triggers) ──
+    # ── Reset (protected) ─────────────────────────────────────────────────────
     @app.route('/reset', methods=['GET', 'POST'])
     def reset():
         engine = engine_ref.get('engine')

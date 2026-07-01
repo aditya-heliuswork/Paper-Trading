@@ -1,19 +1,21 @@
 # ============================================================================
 # PETROQUANT PAPER TRADING — INTRADAY SIGNAL MODEL
 # ============================================================================
-# Rolling-window XGBoost classifier for 5-minute price direction prediction.
+# Rolling-window XGBoost classifier for WTI price direction prediction.
+# Supports all timeframes: 1m, 5m, 15m, 1h, 1d
 #
 # Strategy:
-#   - Train on last N 1-min bars (rolling window, no walk-forward — too slow at 1m)
-#   - Predict: will Close[now+5] > Close[now]? (1=UP, 0=DOWN)
-#   - Retrain every RETRAIN_EVERY_MINS (default 4 hours) for market adaptation
+#   - Train on last N bars (rolling window, no walk-forward)
+#   - Predict: will Close[now+horizon] > Close[now]? (1=UP, 0=DOWN)
+#   - Retrain every RETRAIN_EVERY_MINS for market adaptation
 #   - Returns (signal, probability) for the latest bar
 #
 # IntradaySignalModel:
-#   train(feat_df)         — fits XGBoost on provided labeled data
-#   predict_latest(feat_df)— returns (signal, prob) for last row
-#   should_retrain()       — True if overdue for retraining
+#   train(feat_df)          — fits XGBoost on provided labeled data
+#   predict_latest(feat_df) — returns (signal, prob) for last row
+#   should_retrain()        — True if overdue for retraining
 #   get_feature_importance()— returns pd.Series
+#   get_model_status()      — returns dict with training metadata
 # ============================================================================
 
 import numpy as np
@@ -33,34 +35,50 @@ logger = logging.getLogger(__name__)
 
 class IntradaySignalModel:
     """
-    Rolling-window XGBoost classifier for 1-min WTI data.
+    Rolling-window XGBoost classifier for WTI OHLCV data.
 
-    Predicts price direction 5 minutes forward.
-    Retrains on the latest N bars every 4 hours.
+    Predicts price direction N bars forward.
+    Retrains on the latest N bars every RETRAIN_EVERY_MINS.
+
+    Bug #8 fix: min_train_bars is now sourced from config (which is timeframe-aware)
+    so the model won't refuse to train on coarser timeframes where fewer bars exist.
     """
 
     def __init__(self,
-                 horizon: int = cfg.PREDICT_HORIZON,
-                 min_train_bars: int = cfg.MIN_TRAIN_BARS,
-                 retrain_every_mins: int = cfg.RETRAIN_EVERY_MINS,
+                 horizon: int = None,
+                 min_train_bars: int = None,
+                 retrain_every_mins: int = None,
                  buy_threshold: float = cfg.BUY_THRESHOLD,
                  sell_threshold: float = cfg.SELL_THRESHOLD):
 
-        self.horizon           = horizon
-        self.min_train_bars    = min_train_bars
-        self.retrain_every_mins= retrain_every_mins
-        self.buy_threshold     = buy_threshold
-        self.sell_threshold    = sell_threshold
+        # Use values from config (which reflect the active timeframe)
+        self.horizon            = horizon            or cfg.PREDICT_HORIZON
+        self.min_train_bars     = min_train_bars     or cfg.MIN_TRAIN_BARS
+        self.retrain_every_mins = retrain_every_mins or cfg.RETRAIN_EVERY_MINS
+        self.buy_threshold      = buy_threshold
+        self.sell_threshold     = sell_threshold
 
         # Internal state
-        self._model            = None
-        self._scaler           = None
-        self._feature_cols     = []
-        self._last_train_time  = None
-        self._last_train_acc   = None
-        self._n_train_bars     = 0
-        self._is_trained       = False
+        self._model              = None
+        self._scaler             = None
+        self._feature_cols       = []
+        self._last_train_time    = None
+        self._last_train_acc     = None
+        self._n_train_bars       = 0
+        self._is_trained         = False
         self._feature_importance = None
+
+    def refresh_from_config(self) -> None:
+        """
+        Re-read horizon / min_train_bars / retrain_every_mins from the current
+        config. Call this after apply_timeframe() to keep the model in sync.
+        """
+        self.horizon            = cfg.PREDICT_HORIZON
+        self.min_train_bars     = cfg.MIN_TRAIN_BARS
+        self.retrain_every_mins = cfg.RETRAIN_EVERY_MINS
+        logger.info(f"[Model] Refreshed from config — "
+                    f"horizon={self.horizon}, min_bars={self.min_train_bars}, "
+                    f"retrain_mins={self.retrain_every_mins}")
 
     # ── Training ─────────────────────────────────────────────────────────────
     def train(self, feat_df: pd.DataFrame) -> dict:
@@ -69,8 +87,7 @@ class IntradaySignalModel:
 
         Parameters
         ----------
-        feat_df : pd.DataFrame — output of build_features() (must include 'Target')
-                                  If 'Target' not present, build_target() is called internally.
+        feat_df : pd.DataFrame — output of build_features() (with or without 'Target')
 
         Returns
         -------
@@ -80,8 +97,10 @@ class IntradaySignalModel:
             feat_df = build_target(feat_df, horizon=self.horizon)
 
         if len(feat_df) < self.min_train_bars:
-            logger.warning(f"[Model] Only {len(feat_df)} bars — need {self.min_train_bars} to train. Skipping.")
-            return {'status': 'skipped', 'reason': 'not enough bars'}
+            logger.warning(f"[Model] Only {len(feat_df)} bars — "
+                           f"need {self.min_train_bars} to train. Skipping.")
+            return {'status': 'skipped', 'reason': 'not enough bars',
+                    'have': len(feat_df), 'need': self.min_train_bars}
 
         # ── Select features ──────────────────────────────────────────────────
         self._feature_cols = get_feature_columns(feat_df)
@@ -96,21 +115,20 @@ class IntradaySignalModel:
         y_val     = y[split:]
 
         # ── Scale ────────────────────────────────────────────────────────────
-        self._scaler = StandardScaler()
+        self._scaler  = StandardScaler()
         X_train_s = self._scaler.fit_transform(X_train)
         X_val_s   = self._scaler.transform(X_val)
 
         # ── XGBoost — calibrated for intraday noise ───────────────────────
-        # Lighter model than daily: shallower trees, more regularization
         self._model = XGBClassifier(
-            max_depth        = 3,        # shallow to avoid overfitting noise
+            max_depth        = 3,
             n_estimators     = 200,
             learning_rate    = 0.05,
             subsample        = 0.7,
             colsample_bytree = 0.7,
-            min_child_weight = 10,       # stronger regularization at 1-min scale
-            reg_alpha        = 0.1,      # L1 regularization
-            reg_lambda       = 1.0,      # L2 regularization
+            min_child_weight = 10,
+            reg_alpha        = 0.1,
+            reg_lambda       = 1.0,
             objective        = 'binary:logistic',
             eval_metric      = 'logloss',
             random_state     = 42,
@@ -119,8 +137,8 @@ class IntradaySignalModel:
 
         self._model.fit(
             X_train_s, y_train,
-            eval_set         = [(X_val_s, y_val)],
-            verbose          = False,
+            eval_set = [(X_val_s, y_val)],
+            verbose  = False,
         )
 
         # ── Validation accuracy ───────────────────────────────────────────
@@ -144,7 +162,8 @@ class IntradaySignalModel:
 
         logger.info(f"[Model] Trained | bars={len(feat_df)} | "
                     f"val_acc={val_acc:.2%} ({acc_grade}) | "
-                    f"features={len(self._feature_cols)}")
+                    f"features={len(self._feature_cols)} | "
+                    f"horizon={self.horizon}")
 
         return {
             'status'       : 'trained',
@@ -210,7 +229,7 @@ class IntradaySignalModel:
         Returns True if the model should be retrained.
         Triggers if:
           - Never been trained
-          - More than RETRAIN_EVERY_MINS have passed since last training
+          - More than retrain_every_mins have passed since last training
         """
         if not self._is_trained or self._last_train_time is None:
             return True
@@ -226,17 +245,19 @@ class IntradaySignalModel:
     def get_model_status(self) -> dict:
         """Returns current model state summary."""
         if not self._is_trained:
-            return {'trained': False}
+            return {'trained': False, 'timeframe': cfg.ACTIVE_TIMEFRAME}
 
         elapsed = (datetime.utcnow() - self._last_train_time).total_seconds() / 60
         retrain_in = max(0, self.retrain_every_mins - elapsed)
 
         return {
-            'trained'        : True,
-            'last_train_utc' : self._last_train_time.isoformat(),
-            'val_accuracy'   : self._last_train_acc,
-            'n_train_bars'   : self._n_train_bars,
-            'n_features'     : len(self._feature_cols),
+            'trained'            : True,
+            'last_train_utc'     : self._last_train_time.isoformat(),
+            'val_accuracy'       : self._last_train_acc,
+            'n_train_bars'       : self._n_train_bars,
+            'n_features'         : len(self._feature_cols),
             'retrain_due_in_mins': round(retrain_in, 1),
-            'needs_retrain'  : self.should_retrain(),
+            'needs_retrain'      : self.should_retrain(),
+            'horizon'            : self.horizon,
+            'timeframe'          : cfg.ACTIVE_TIMEFRAME,
         }

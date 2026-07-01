@@ -2,22 +2,18 @@
 # PETROQUANT PAPER TRADING — ORDER ENGINE
 # ============================================================================
 # Translates model signals into portfolio actions.
-# Handles: position closing, new entries, duplicate signal suppression, and regime scaling.
+# Handles: position closing, new entries, duplicate signal suppression, regime scaling.
 #
 # Logic:
 #   BUY signal  + no position  → open LONG
 #   SELL signal + no position  → open SHORT
-#   BUY signal  + SHORT open   → close SHORT only, go FLAT (re-enter next bar if signal persists)
-#   SELL signal + LONG open    → close LONG only, go FLAT (re-enter next bar if signal persists)
+#   BUY signal  + SHORT open   → close SHORT only, go FLAT (re-enter next bar)
+#   SELL signal + LONG open    → close LONG only, go FLAT (re-enter next bar)
 #   Same direction as current  → HOLD (don't churn)
 #   HOLD signal                → do nothing
 #
-# Rationale: Immediately flipping from LONG→SHORT (or vice versa) in one bar
-# doubles risk at the worst moment and acts on potentially noisy signals.
-# Closing first and re-evaluating next bar is safer for intraday ML models.
-#
-# OrderEngine:
-#   execute(signal, prob, price, regime, regime_mult) → dict of actions taken
+# Bug #9 fix: log_snapshot() is now called even when daily loss limit is hit,
+#   ensuring the equity snapshot chain is never broken.
 # ============================================================================
 
 import logging
@@ -79,7 +75,9 @@ class OrderEngine:
 
         # ── Circuit breaker check ─────────────────────────────────────────────
         if portfolio.is_daily_loss_limit_hit():
-            _log_and_return(log, 'HOLD', signal, price, 0, probability, regime,
+            # Bug #9 fix: log the snapshot even on daily loss limit hit
+            log.log_snapshot(bar_time, snapshot, regime, signal, probability)
+            _log_hold_trade(log, 'HOLD', signal, price, 0, probability, regime,
                             regime_mult, snapshot, 'DAILY_LOSS_LIMIT', bar_time)
             return {'action': 'HOLD', 'reason': 'daily_loss_limit'}
 
@@ -146,6 +144,7 @@ class OrderEngine:
         qty = portfolio.position_size_units(price, regime_mult, probability)
 
         if qty <= 0:
+            log.log_snapshot(bar_time, snapshot, regime, signal, probability)
             return {'action': 'HOLD', 'reason': 'zero_qty'}
 
         if action == 'OPEN_LONG':
@@ -207,46 +206,38 @@ class OrderEngine:
           'CLOSE_LONG'  — currently long,  SELL signal → close only, go FLAT
           'CLOSE_SHORT' — currently short, BUY  signal → close only, go FLAT
           'HOLD'        — same direction as open position, or HOLD signal
-
-        Note: Opposite signals close the position and go FLAT.
-        The next bar re-evaluates cleanly from a flat state.
-        This avoids doubling risk by immediately flipping direction on a single noisy bar.
         """
         if signal == 'HOLD':
             return 'HOLD'
 
         if current_side is None:
-            # No open position — open fresh in signal direction
             return 'OPEN_LONG' if signal == 'BUY' else 'OPEN_SHORT'
 
         if signal == 'BUY' and current_side == 'SHORT':
-            # Opposite signal — close short, go flat (do NOT open long yet)
             return 'CLOSE_SHORT'
         elif signal == 'SELL' and current_side == 'LONG':
-            # Opposite signal — close long, go flat (do NOT open short yet)
             return 'CLOSE_LONG'
         else:
-            # Same direction as current position — don't churn
             return 'HOLD'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def _log_and_return(log, action, signal, price, qty, probability,
+def _log_hold_trade(log, action, signal, price, qty, probability,
                     regime, regime_mult, snapshot, notes, bar_time):
-    """Helper to log a HOLD event."""
+    """Helper to log a HOLD/circuit-breaker event."""
     log.log_trade(
-        timestamp    = bar_time,
-        action       = action,
-        signal       = signal,
-        price        = price,
-        quantity     = qty,
-        commission   = 0.0,
-        regime       = regime,
-        probability  = probability,
-        position_size= regime_mult,
-        pnl_realized = 0.0,
-        pnl_unrealized=snapshot.get('unrealized_pnl', 0.0),
-        cash_balance = snapshot['cash'],
-        equity       = snapshot['equity'],
-        notes        = notes,
+        timestamp     = bar_time,
+        action        = action,
+        signal        = signal,
+        price         = price,
+        quantity      = qty,
+        commission    = 0.0,
+        regime        = regime,
+        probability   = probability,
+        position_size = regime_mult,
+        pnl_realized  = 0.0,
+        pnl_unrealized= snapshot.get('unrealized_pnl', 0.0),
+        cash_balance  = snapshot['cash'],
+        equity        = snapshot['equity'],
+        notes         = notes,
     )

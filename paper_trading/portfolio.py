@@ -14,9 +14,12 @@
 #   open_long(qty, price)     — buy N units at fill price
 #   open_short(qty, price)    — sell short N units at fill price
 #   close_position(price)     — close current open position
-#   mark_to_market(price)     — compute unrealized P&L
+#   mark_to_market(price)     — compute unrealized P&L and record snapshot
 #   get_snapshot()            — dict of all current metrics
 #   position_size_units(...)  — how many units to trade given capital rules
+#
+# Bug #3 fix: restore_from_db() now sets cash = initial_capital + realized_pnl
+#   (not equity, which includes abandoned unrealized P&L from crashed positions)
 # ============================================================================
 
 import threading
@@ -109,8 +112,13 @@ class Portfolio:
     def restore_from_db(self, trade_log) -> bool:
         """
         Restore portfolio state from SQLite after a process restart.
-        Treats the account as FLAT on restart (any open position at crash time
-        is logged as abandoned — its P&L is not captured).
+
+        Bug #3 fix:
+          Previously set self.cash = state['equity'] which overstated cash
+          by any unrealized P&L from an open position that existed at crash time.
+          Correct logic: cash = initial_capital + realized_pnl
+          (position is always reset to None on restart — we can't recover the
+          open position safely, so unrealized P&L at crash is forfeit).
 
         Returns True if restoration succeeded, False if no prior data.
         """
@@ -121,7 +129,11 @@ class Portfolio:
                     logger.info("[Portfolio] No prior DB state found — starting fresh")
                     return False
 
-                self.cash             = state['equity']
+                # Bug #3 fix: reconstruct cash from realized P&L, NOT from equity
+                # equity = cash + unrealized (and unrealized is lost on restart)
+                restored_cash = self.initial_capital + state['realized_pnl']
+
+                self.cash             = restored_cash
                 self.realized_pnl     = state['realized_pnl']
                 self.total_trades     = state['total_trades']
                 self.winning_trades   = state['winning_trades']
@@ -129,19 +141,19 @@ class Portfolio:
                 self.total_win_pnl    = state['total_win_pnl']
                 self.total_loss_pnl   = state['total_loss_pnl']
                 self.total_commission = state['total_commission']
-                self._day_start_equity= state['equity']
+                self._day_start_equity= restored_cash
                 self.position         = None   # always restart flat
 
                 if state.get('had_open_position'):
                     logger.warning(
                         "[Portfolio] Restart detected an unclosed position in DB. "
-                        "The position has been abandoned — its unrealized P&L is not "
-                        "captured. Consider reviewing the last open trade."
+                        "The position has been abandoned — its unrealized P&L is NOT "
+                        "captured. Cash has been restored from realized P&L only."
                     )
 
                 logger.info(
                     f"[Portfolio] Restored from DB | "
-                    f"equity=${state['equity']:,.2f} | "
+                    f"cash=${restored_cash:,.2f} | "
                     f"realized_pnl=${state['realized_pnl']:+,.2f} | "
                     f"trades={state['total_trades']}"
                 )
@@ -162,12 +174,12 @@ class Portfolio:
         Parameters
         ----------
         price       : float — current WTI price per unit
-        regime_mult : float — from HMM regime (1.0/0.5/0.25)
+        regime_mult : float — from HMM regime (1.0/0.6/0.4)
         confidence  : float — model probability (0.5-1.0)
 
         Returns
         -------
-        float — number of units to trade (min 0.01, capped by max_position_pct)
+        float — number of units to trade (min 0.0, capped by max_position_pct)
         """
         if price <= 0:
             return 0.0
@@ -224,9 +236,7 @@ class Portfolio:
     def open_short(self, qty: float, market_price: float) -> dict:
         """
         Sell short QTY units. Applies slippage (fills at slightly lower price).
-        For paper trading futures: we reserve the full notional as collateral
-        (not just 10% margin) so cash accounting stays consistent — the notional
-        is returned at close plus/minus P&L.
+        For paper trading futures: reserve the full notional as collateral.
         """
         with self._lock:
             if self.position is not None:
@@ -240,7 +250,6 @@ class Portfolio:
             notional    = fill_price * qty
             commission  = notional * self.commission_pct
 
-            # Reserve full notional as collateral (returned at close ± P&L)
             if notional + commission > self.cash:
                 return {'status': 'rejected', 'reason': 'insufficient_cash'}
 
@@ -274,13 +283,13 @@ class Portfolio:
                 fill_price  = market_price * (1 - self.slippage_pct)   # exit lower
                 pnl         = (fill_price - pos.entry_price) * pos.qty
                 proceeds    = fill_price * pos.qty
-                self.cash  += proceeds                                  # return notional + gain
+                self.cash  += proceeds
 
             else:  # SHORT — return locked notional + capture P&L
                 fill_price  = market_price * (1 + self.slippage_pct)   # exit higher (worse)
                 pnl         = (pos.entry_price - fill_price) * pos.qty
                 notional_at_entry = pos.entry_price * pos.qty
-                self.cash  += notional_at_entry + pnl                  # return collateral ± P&L
+                self.cash  += notional_at_entry + pnl
 
             commission       = abs(fill_price * pos.qty * self.commission_pct)
             self.cash       -= commission
@@ -379,7 +388,7 @@ class Portfolio:
         """Circuit breaker: stop trading if daily loss > max_daily_loss% of equity."""
         if self._daily_pnl >= 0:
             return False
-        loss_pct = abs(self._daily_pnl) / self._day_start_equity
+        loss_pct = abs(self._daily_pnl) / max(self._day_start_equity, 1)
         if loss_pct >= self.max_daily_loss:
             logger.warning(f"[Portfolio] Daily loss limit hit! "
                            f"Loss=${abs(self._daily_pnl):.2f} ({loss_pct:.1%})")

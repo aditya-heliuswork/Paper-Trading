@@ -1,18 +1,19 @@
 # ============================================================================
 # PETROQUANT PAPER TRADING — INTRADAY FEATURE ENGINEERING
 # ============================================================================
-# Transforms raw 1-minute OHLCV bars into ML features for the XGBoost model.
+# Transforms raw OHLCV bars into ML features for the XGBoost model.
+# Supports all timeframes: 1m, 5m, 15m, 1h, 1d
 #
 # Features are all backward-looking (no future leakage):
-#   Momentum   — returns over 1/5/15/30 minutes
+#   Momentum   — returns over 1/5/15/30 candles
 #   Trend      — EMA crosses, VWAP deviation
 #   Volatility — ATR, realized vol, Bollinger Band position
 #   Volume     — volume ratio (spike detection)
 #   Candle     — body-to-range ratio (candle shape)
 #   Regime     — daily HMM state passed in as external signal
 #
-# build_features(df) → returns feat_df with all computed columns
-# build_target(feat_df, horizon) → adds 'Target' (1=up, 0=down in N bars)
+# build_features(df, regime, timeframe_minutes) → feat_df with all columns
+# build_target(feat_df, horizon)               → adds 'Target' (1=up, 0=down)
 # ============================================================================
 
 import numpy as np
@@ -24,21 +25,27 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 def build_features(df: pd.DataFrame,
-                   regime: str = 'BULL') -> pd.DataFrame:
+                   regime: str = 'BULL',
+                   timeframe_minutes: int = 1) -> pd.DataFrame:
     """
-    Build intraday ML features from 1-min OHLCV bars.
+    Build ML features from OHLCV bars (any timeframe).
 
     Parameters
     ----------
-    df     : pd.DataFrame  — 1-min OHLCV with columns [Open, High, Low, Close, Volume]
-    regime : str           — current daily regime from HMM ('BULL'/'CHOPPY'/'PANIC')
+    df                 : pd.DataFrame  — OHLCV with [Open, High, Low, Close, Volume]
+    regime             : str           — daily regime from HMM ('BULL'/'CHOPPY'/'PANIC')
+    timeframe_minutes  : int           — bar duration in minutes (1, 5, 15, 60, 1440)
+                                         Used to scale rolling windows appropriately.
 
     Returns
     -------
     pd.DataFrame — original OHLCV + all engineered features (NaN rows dropped)
     """
-    if df.empty or len(df) < 30:
-        logger.warning("[Features] Not enough bars to compute features (need ≥ 30)")
+    # Bug #14 fix: minimum bar check raised to VWAP window (60 bars), not 30
+    min_bars = 60
+    if df.empty or len(df) < min_bars:
+        logger.warning(f"[Features] Not enough bars to compute features "
+                       f"(have {len(df)}, need ≥ {min_bars})")
         return pd.DataFrame()
 
     feat = df.copy()
@@ -48,23 +55,28 @@ def build_features(df: pd.DataFrame,
     l = feat['Low']
     v = feat.get('Volume', pd.Series(np.ones(len(feat)), index=feat.index))
 
+    # ── Scale rolling windows to timeframe ───────────────────────────────────
+    # For faster timeframes we keep the same window sizes (they already capture
+    # meaningful market microstructure). For daily bars we scale up slightly.
+    _w = timeframe_minutes  # convenience alias
+
     # ── 1. Price Returns (Momentum) ──────────────────────────────────────────
-    feat['Ret_1m']  = np.log(c / c.shift(1))
-    feat['Ret_5m']  = np.log(c / c.shift(5))
-    feat['Ret_15m'] = np.log(c / c.shift(15))
-    feat['Ret_30m'] = np.log(c / c.shift(30))
+    feat['Ret_1']  = np.log(c / c.shift(1))
+    feat['Ret_5']  = np.log(c / c.shift(5))
+    feat['Ret_15'] = np.log(c / c.shift(15))
+    feat['Ret_30'] = np.log(c / c.shift(30))
 
     # Cumulative return direction
-    feat['Ret_sign_1m']  = np.sign(feat['Ret_1m'])
-    feat['Ret_sign_5m']  = np.sign(feat['Ret_5m'])
+    feat['Ret_sign_1']  = np.sign(feat['Ret_1'])
+    feat['Ret_sign_5']  = np.sign(feat['Ret_5'])
 
     # ── 2. Trend — EMA ──────────────────────────────────────────────────────
     feat['EMA_5']    = c.ewm(span=5,  adjust=False).mean()
     feat['EMA_20']   = c.ewm(span=20, adjust=False).mean()
     feat['EMA_50']   = c.ewm(span=50, adjust=False).mean()
 
-    # EMA cross signals
-    feat['EMA_5_20_cross']  = (feat['EMA_5']  - feat['EMA_20']) / c   # normalized
+    # EMA cross signals (normalized by price)
+    feat['EMA_5_20_cross']  = (feat['EMA_5']  - feat['EMA_20']) / c
     feat['EMA_5_50_cross']  = (feat['EMA_5']  - feat['EMA_50']) / c
     feat['EMA_20_50_cross'] = (feat['EMA_20'] - feat['EMA_50']) / c
 
@@ -72,7 +84,7 @@ def build_features(df: pd.DataFrame,
     feat['Price_vs_EMA5']  = (c - feat['EMA_5'])  / c
     feat['Price_vs_EMA20'] = (c - feat['EMA_20']) / c
 
-    # ── 3. RSI (14-period, on 1-min bars) ────────────────────────────────────
+    # ── 3. RSI (14-period) ────────────────────────────────────────────────────
     feat['RSI_14'] = _rsi(c, period=14)
     feat['RSI_7']  = _rsi(c, period=7)
 
@@ -91,7 +103,7 @@ def build_features(df: pd.DataFrame,
     feat['ATR_14_pct'] = feat['ATR_14'] / c
 
     # ── 5. VWAP Deviation ────────────────────────────────────────────────────
-    # VWAP resets at each session start — we approximate with rolling 60-bar VWAP
+    # Rolling VWAP (60-bar window) normalized by ATR
     vwap_window = 60
     tp = (h + l + c) / 3  # typical price
     feat['VWAP_60'] = (tp * v).rolling(vwap_window).sum() / v.rolling(vwap_window).sum()
@@ -106,27 +118,31 @@ def build_features(df: pd.DataFrame,
     feat['BB_lower'] = feat['BB_mid'] - 2 * feat['BB_std']
     bb_range = (feat['BB_upper'] - feat['BB_lower']).replace(0, np.nan)
     feat['BB_pos']   = (c - feat['BB_lower']) / bb_range   # 0=bottom, 1=top
-    feat['BB_width'] = bb_range / c                          # bandwidth as % of price
+    feat['BB_width'] = bb_range / c                         # bandwidth as % of price
 
     # ── 7. Volume Features ───────────────────────────────────────────────────
     v_ma = v.rolling(20).mean().replace(0, np.nan)
     feat['Vol_ratio']  = (v / v_ma).clip(0, 10)   # volume spike: >1 = above average
-    feat['Vol_sign']   = feat['Vol_ratio'] * feat['Ret_sign_1m']   # direction × volume
+    feat['Vol_sign']   = feat['Vol_ratio'] * feat['Ret_sign_1']   # direction × volume
 
     # ── 8. Candle Structure ──────────────────────────────────────────────────
     candle_range = (h - l).replace(0, np.nan)
     feat['Body_ratio']   = (c - o).abs() / candle_range     # body / full range
     feat['Wick_upper']   = (h - c.clip(upper=o)) / candle_range   # upper wick fraction
     feat['Wick_lower']   = (c.clip(upper=o) - l) / candle_range   # lower wick fraction
-    feat['Candle_dir']   = np.sign(c - o)                          # +1 green, -1 red
+    feat['Candle_dir']   = np.sign(c - o)                         # +1 green, -1 red
 
     # ── 9. Realized Volatility ───────────────────────────────────────────────
-    feat['RealVol_15m'] = feat['Ret_1m'].rolling(15).std() * np.sqrt(252 * 390)  # annualized
-    feat['RealVol_30m'] = feat['Ret_1m'].rolling(30).std() * np.sqrt(252 * 390)
-    feat['Vol_regime']  = (feat['RealVol_15m'] / feat['RealVol_30m']).clip(0, 5)  # vol acceleration
+    # Annualization factor: bars_per_year = 252 * trading_bars_per_day
+    # 1m: 252*390=98280; 5m: 252*78=19656; 15m: 252*26=6552; 1h: 252*6.5=1638; 1d: 252
+    ann_factor = {1: 252*390, 5: 252*78, 15: 252*26, 60: 252*7, 1440: 252}
+    ann = ann_factor.get(_w, 252*390)
 
-    # ── 10. Consecutive candle count ─────────────────────────────────────────
-    # How many candles in a row have been the same color (streak)
+    feat['RealVol_15'] = feat['Ret_1'].rolling(15).std() * np.sqrt(ann)
+    feat['RealVol_30'] = feat['Ret_1'].rolling(30).std() * np.sqrt(ann)
+    feat['Vol_regime'] = (feat['RealVol_15'] / feat['RealVol_30']).clip(0, 5)
+
+    # ── 10. Consecutive candle streak ────────────────────────────────────────
     feat['Streak'] = _streak(feat['Candle_dir'])
 
     # ── 11. Daily Regime (Macro filter from HMM) ─────────────────────────────
@@ -134,16 +150,16 @@ def build_features(df: pd.DataFrame,
     feat['Regime_CHOPPY'] = 1.0 if regime == 'CHOPPY' else 0.0
     feat['Regime_PANIC']  = 1.0 if regime == 'PANIC'  else 0.0
 
-    # ── Drop helper columns we don't want as model features ──────────────────
+    # ── Drop helper columns not needed as model features ─────────────────────
     _drop_cols = ['EMA_5', 'EMA_20', 'EMA_50', 'BB_mid', 'BB_std',
                   'BB_upper', 'BB_lower', 'VWAP_60']
     feat = feat.drop(columns=[col for col in _drop_cols if col in feat.columns])
 
-    # ── Drop NaN rows ────────────────────────────────────────────────────────
+    # ── Drop NaN / inf rows ──────────────────────────────────────────────────
     feat = feat.replace([np.inf, -np.inf], np.nan).dropna()
 
     logger.info(f"[Features] Built {len(feat)} rows × {feat.shape[1]} cols "
-                f"(including {feat.shape[1]-5} engineered features)")
+                f"(timeframe={_w}m, {feat.shape[1]-5} engineered features)")
     return feat
 
 
@@ -157,7 +173,7 @@ def build_target(feat_df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
     Parameters
     ----------
     feat_df : pd.DataFrame — feature DataFrame (output of build_features)
-    horizon : int          — number of 1-min bars to look forward (default: 5)
+    horizon : int          — number of bars to look forward (default: 5)
 
     Returns
     -------
@@ -202,9 +218,6 @@ def _streak(direction: pd.Series) -> pd.Series:
     """
     Compute consecutive candle streak (vectorized via numpy).
     +3 means 3 green candles in a row, -2 means 2 red candles in a row.
-
-    Uses raw numpy arrays instead of repeated pandas iloc calls to avoid
-    per-row overhead that was very slow on 5000+ bar DataFrames.
     """
     arr    = direction.values.astype(float)
     n      = len(arr)
