@@ -79,6 +79,11 @@ class PaperTradingEngine:
         self.regime_det  = DailyRegimeDetector()
         self.order_engine= OrderEngine(self.portfolio, self.trade_log)
 
+        # ── Restore state from DB (survives server restarts) ─────────────────
+        restored = self.portfolio.restore_from_db(self.trade_log)
+        if not restored:
+            logger.info("[Engine] Fresh start — no prior trade history found in DB")
+
         # ── Live state (read by web server) ──────────────────────────────────
         self.last_price      = None
         self.last_signal     = 'HOLD'
@@ -134,13 +139,12 @@ class PaperTradingEngine:
 
     def reset_account(self):
         """Wipe all trades and reset portfolio to initial capital."""
-        import sqlite3
-        with sqlite3.connect(cfg.DB_PATH) as conn:
+        with self.trade_log._get_conn() as conn:
             conn.execute("DELETE FROM trades")
             conn.execute("DELETE FROM snapshots")
-        self.portfolio   = Portfolio()
-        self.order_engine= OrderEngine(self.portfolio, self.trade_log)
-        self.model       = IntradaySignalModel()
+        self.portfolio    = Portfolio()
+        self.order_engine = OrderEngine(self.portfolio, self.trade_log)
+        self.model        = IntradaySignalModel()
         logger.warning("[Engine] Account RESET — all trades cleared, portfolio restarted.")
 
     # ── Trading Loop ──────────────────────────────────────────────────────────

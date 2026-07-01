@@ -113,7 +113,6 @@ class IntradaySignalModel:
             reg_lambda       = 1.0,      # L2 regularization
             objective        = 'binary:logistic',
             eval_metric      = 'logloss',
-            use_label_encoder= False,
             random_state     = 42,
             verbosity        = 0,
         )

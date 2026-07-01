@@ -21,6 +21,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+from contextlib import contextmanager
 import logging
 import os
 
@@ -52,8 +53,7 @@ class TradeLog:
     # ── Database Setup ────────────────────────────────────────────────────────
     def _init_db(self):
         """Create tables if they don't exist."""
-        conn = self._connect()
-        try:
+        with self._get_conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,10 +103,6 @@ class TradeLog:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_action ON trades(action)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(timestamp)")
-            conn.commit()
-        finally:
-            if self._mem_conn is None:   # only close file-based connections
-                conn.close()
 
     # ── Write ─────────────────────────────────────────────────────────────────
     def log_trade(self,
@@ -133,7 +129,7 @@ class TradeLog:
         # Running cumulative P&L
         cum_pnl = self._get_cumulative_pnl() + pnl_realized
 
-        with self._connect() as conn:
+        with self._get_conn() as conn:
             cursor = conn.execute("""
                 INSERT INTO trades
                     (timestamp, date, action, signal, ticker, interval, horizon,
@@ -164,7 +160,7 @@ class TradeLog:
         ts_str   = timestamp.isoformat() if isinstance(timestamp, datetime) else str(timestamp)
         date_str = ts_str[:10]
 
-        with self._connect() as conn:
+        with self._get_conn() as conn:
             conn.execute("""
                 INSERT INTO snapshots
                     (timestamp, date, cash, equity, unrealized_pnl, realized_pnl,
@@ -193,27 +189,29 @@ class TradeLog:
         limit        : int  — max rows to return (most recent first), None = all
         actions_only : bool — if True, excludes HOLD rows
         """
-        query = "SELECT * FROM trades"
-        if actions_only:
-            query += " WHERE action NOT IN ('HOLD')"
-        query += " ORDER BY timestamp DESC"
-        if limit:
-            query += f" LIMIT {limit}"
+        where = " WHERE action NOT IN ('HOLD')" if actions_only else ""
+        query = f"SELECT * FROM trades{where} ORDER BY timestamp DESC"
 
-        with self._connect() as conn:
-            df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
+        with self._get_conn() as conn:
+            if limit:
+                df = pd.read_sql_query(query + " LIMIT ?", conn,
+                                       params=[int(limit)], parse_dates=['timestamp'])
+            else:
+                df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
         return df
 
     def get_snapshots(self, limit: int = 1000) -> pd.DataFrame:
-        """Returns equity snapshots as a DataFrame."""
-        query = f"SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT {limit}"
-        with self._connect() as conn:
-            df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
-        return df.sort_values('timestamp').reset_index(drop=True)
+        """Returns equity snapshots as a DataFrame, ordered oldest-first."""
+        with self._get_conn() as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM snapshots ORDER BY timestamp ASC LIMIT ?",
+                conn, params=(limit,), parse_dates=['timestamp']
+            )
+        return df.reset_index(drop=True)
 
     def get_summary(self) -> dict:
         """Returns key statistics from the trade log."""
-        with self._connect() as conn:
+        with self._get_conn() as conn:
             # Trade counts
             counts = conn.execute("""
                 SELECT
@@ -266,7 +264,7 @@ class TradeLog:
     def get_today_trades(self) -> pd.DataFrame:
         """Returns trades executed today only."""
         today = datetime.utcnow().strftime('%Y-%m-%d')
-        with self._connect() as conn:
+        with self._get_conn() as conn:
             df = pd.read_sql_query(
                 "SELECT * FROM trades WHERE date = ? ORDER BY timestamp",
                 conn, params=(today,), parse_dates=['timestamp']
@@ -274,24 +272,91 @@ class TradeLog:
         return df
 
     # ── Internal ──────────────────────────────────────────────────────────────
-    def _connect(self) -> sqlite3.Connection:
-        """Returns a database connection with WAL mode for concurrency."""
+    @contextmanager
+    def _get_conn(self):
+        """
+        Context manager that yields a db connection and always closes it.
+        For in-memory DBs, reuses the single persistent connection.
+        For file DBs, opens a fresh connection, commits on success, closes on exit.
+        This fixes the connection leak that existed with the old _connect() approach.
+        """
         if self._mem_conn is not None:
-            # In-memory: always return the same connection object
             self._mem_conn.row_factory = sqlite3.Row
-            return self._mem_conn
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")   # write-ahead logging
-        conn.row_factory = sqlite3.Row
-        return conn
+            yield self._mem_conn
+        else:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _get_cumulative_pnl(self) -> float:
         """Get the last cumulative_pnl value for running total calculation."""
         try:
-            with self._connect() as conn:
+            with self._get_conn() as conn:
                 row = conn.execute(
                     "SELECT cumulative_pnl FROM trades ORDER BY id DESC LIMIT 1"
                 ).fetchone()
                 return float(row[0]) if row and row[0] is not None else 0.0
         except Exception:
             return 0.0
+
+    def get_portfolio_state(self) -> dict:
+        """
+        Reconstruct portfolio state from DB for restoration after a restart.
+        Returns empty dict if no prior data exists.
+        """
+        try:
+            with self._get_conn() as conn:
+                snap = conn.execute("""
+                    SELECT equity, realized_pnl, total_trades
+                    FROM snapshots ORDER BY timestamp DESC LIMIT 1
+                """).fetchone()
+
+                if not snap or snap[0] is None:
+                    return {}
+
+                stats = conn.execute("""
+                    SELECT
+                        SUM(CASE WHEN action LIKE 'CLOSE%' AND pnl_realized > 0
+                                 THEN pnl_realized ELSE 0 END)          AS total_win_pnl,
+                        SUM(CASE WHEN action LIKE 'CLOSE%' AND pnl_realized < 0
+                                 THEN ABS(pnl_realized) ELSE 0 END)     AS total_loss_pnl,
+                        SUM(CASE WHEN action LIKE 'CLOSE%' AND pnl_realized > 0
+                                 THEN 1 ELSE 0 END)                     AS winning_trades,
+                        SUM(CASE WHEN action LIKE 'CLOSE%' AND pnl_realized <= 0
+                                 THEN 1 ELSE 0 END)                     AS losing_trades,
+                        SUM(CASE WHEN action LIKE 'OPEN%'  THEN 1 ELSE 0 END) AS total_trades,
+                        COALESCE(SUM(commission), 0)                    AS total_commission
+                    FROM trades
+                """).fetchone()
+
+                last_action = conn.execute("""
+                    SELECT action, price, quantity
+                    FROM trades
+                    WHERE action LIKE 'OPEN%' OR action LIKE 'CLOSE%'
+                    ORDER BY id DESC LIMIT 1
+                """).fetchone()
+
+                had_open = bool(last_action and last_action[0].startswith('OPEN_'))
+
+            return {
+                'equity'          : float(snap[0]),
+                'realized_pnl'    : float(snap[1] or 0.0),
+                'total_trades'    : int(stats[4] or 0),
+                'winning_trades'  : int(stats[2] or 0),
+                'losing_trades'   : int(stats[3] or 0),
+                'total_win_pnl'   : float(stats[0] or 0.0),
+                'total_loss_pnl'  : float(stats[1] or 0.0),
+                'total_commission': float(stats[5] or 0.0),
+                'had_open_position': had_open,
+            }
+        except Exception as e:
+            logger.error(f"[TradeLog] get_portfolio_state error: {e}")
+            return {}

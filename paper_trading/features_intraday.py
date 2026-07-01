@@ -135,8 +135,9 @@ def build_features(df: pd.DataFrame,
     feat['Regime_PANIC']  = 1.0 if regime == 'PANIC'  else 0.0
 
     # ── Drop helper columns we don't want as model features ──────────────────
-    _drop = ['EMA_5', 'EMA_20', 'EMA_50', 'BB_mid', 'BB_std', 'BB_upper', 'BB_lower', 'VWAP_60']
-    feat = feat.drop(columns=[c for c in _drop if c in feat.columns])
+    _drop_cols = ['EMA_5', 'EMA_20', 'EMA_50', 'BB_mid', 'BB_std',
+                  'BB_upper', 'BB_lower', 'VWAP_60']
+    feat = feat.drop(columns=[col for col in _drop_cols if col in feat.columns])
 
     # ── Drop NaN rows ────────────────────────────────────────────────────────
     feat = feat.replace([np.inf, -np.inf], np.nan).dropna()
@@ -199,13 +200,21 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def _streak(direction: pd.Series) -> pd.Series:
     """
-    Compute consecutive candle streak.
+    Compute consecutive candle streak (vectorized via numpy).
     +3 means 3 green candles in a row, -2 means 2 red candles in a row.
+
+    Uses raw numpy arrays instead of repeated pandas iloc calls to avoid
+    per-row overhead that was very slow on 5000+ bar DataFrames.
     """
-    streak = pd.Series(0, index=direction.index, dtype=float)
-    for i in range(1, len(direction)):
-        if direction.iloc[i] == direction.iloc[i-1] and direction.iloc[i] != 0:
-            streak.iloc[i] = streak.iloc[i-1] + direction.iloc[i]
+    arr    = direction.values.astype(float)
+    n      = len(arr)
+    streak = np.zeros(n, dtype=float)
+    if n == 0:
+        return pd.Series(streak, index=direction.index)
+    streak[0] = arr[0]
+    for i in range(1, n):
+        if arr[i] == arr[i - 1] and arr[i] != 0:
+            streak[i] = streak[i - 1] + arr[i]
         else:
-            streak.iloc[i] = direction.iloc[i]
-    return streak
+            streak[i] = arr[i]
+    return pd.Series(streak, index=direction.index)

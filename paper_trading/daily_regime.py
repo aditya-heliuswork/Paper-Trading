@@ -74,10 +74,10 @@ class DailyRegimeDetector:
         return (self._cached_regime, self._cached_mult)
 
     def should_refresh(self) -> bool:
-        """Returns True if the cache is stale (new calendar day)."""
+        """Returns True if the cache is stale (new UTC calendar day)."""
         if self._cache_date is None:
             return True
-        return self._cache_date != date.today()
+        return self._cache_date != datetime.utcnow().date()
 
     def get_regime_stats(self) -> dict:
         """Returns last computed regime statistics."""
@@ -126,7 +126,7 @@ class DailyRegimeDetector:
             if not HMM_AVAILABLE:
                 self._cached_regime = self._fallback_regime(df['Close'])
                 self._cached_mult   = cfg.REGIME_MULTIPLIERS.get(self._cached_regime, 0.5)
-                self._cache_date    = date.today()
+                self._cache_date    = datetime.utcnow().date()
                 return
 
             hmm = GaussianHMM(
@@ -166,7 +166,7 @@ class DailyRegimeDetector:
             # ── Update cache ─────────────────────────────────────────────────
             self._cached_regime = current_regime
             self._cached_mult   = cfg.REGIME_MULTIPLIERS.get(current_regime, 0.5)
-            self._cache_date    = date.today()
+            self._cache_date    = datetime.utcnow().date()
 
             # Stats for dashboard
             self._regime_stats = {

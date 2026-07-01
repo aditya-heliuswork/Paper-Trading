@@ -74,8 +74,9 @@ def create_web_server(engine_ref: dict) -> Flask:
     @app.route('/status')
     def status():
         try:
-            portfolio  = engine_ref.get('portfolio')
             engine     = engine_ref.get('engine')
+            # Always read through engine so state is current after any reset
+            portfolio  = engine.portfolio  if engine  else engine_ref.get('portfolio')
             trade_log  = engine_ref.get('trade_log')
 
             current_price = engine.last_price if engine else None
@@ -133,26 +134,42 @@ def create_web_server(engine_ref: dict) -> Flask:
             'uptime_s' : engine.uptime_seconds() if engine else 0,
         })
 
-    # ── Reset (protected) ─────────────────────────────────────────────────────
-    @app.route('/reset')
+    # ── Reset (protected — POST only to prevent accidental/crawler triggers) ──
+    @app.route('/reset', methods=['GET', 'POST'])
     def reset():
-        confirm = request.args.get('confirm', '')
-        if confirm != 'yes':
-            return Response("""
+        engine = engine_ref.get('engine')
+
+        if request.method == 'GET':
+            capital_fmt = f"${cfg.INITIAL_CAPITAL:,.0f}"
+            return Response(f"""
                 <html><body style="font-family:sans-serif;background:#0d1117;color:#e6edf3;padding:40px">
-                <h2>⚠️ Reset Paper Account</h2>
-                <p>This will delete ALL trades and reset the portfolio to $1,000,000.</p>
-                <a href="/reset?confirm=yes" style="color:#f85149">Click here to confirm reset</a>
-                <br><br><a href="/" style="color:#388bfd">← Back to dashboard</a>
+                <h2>&#9888; Reset Paper Account</h2>
+                <p>This will permanently delete <strong>ALL trades</strong> and reset
+                the portfolio to <strong>{capital_fmt}</strong>.</p>
+                <form method="POST">
+                    <input type="hidden" name="confirm" value="yes">
+                    <button type="submit"
+                        style="background:#f85149;color:#fff;border:none;padding:10px 24px;
+                               font-size:16px;border-radius:6px;cursor:pointer">
+                        Confirm Reset
+                    </button>
+                </form>
+                <br><a href="/" style="color:#388bfd">&#8592; Back to dashboard</a>
                 </body></html>
             """, mimetype='text/html')
 
+        # POST: perform the reset
+        confirm = request.form.get('confirm', '')
+        if confirm != 'yes':
+            return jsonify({'error': 'Must submit confirm=yes via POST'}), 400
+
         try:
-            trade_log = engine_ref.get('trade_log')
-            engine    = engine_ref.get('engine')
             if engine:
                 engine.reset_account()
-            return jsonify({'status': 'reset', 'message': 'Account reset to $1,000,000'})
+                # Keep engine_ref references current after reset
+                engine_ref['portfolio'] = engine.portfolio
+            return jsonify({'status': 'reset',
+                            'message': f'Account reset to ${cfg.INITIAL_CAPITAL:,.0f}'})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
