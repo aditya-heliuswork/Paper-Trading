@@ -2,53 +2,53 @@
 # PETROQUANT PAPER TRADING — CONFIGURATION
 # ============================================================================
 # All tunable parameters in one place.
-# Edit this file to change account size, thresholds, or market settings.
+# 1-minute trading has been REMOVED. Minimum timeframe is 5 minutes.
 #
-# Multi-timeframe support:
-#   call apply_timeframe("5m") to switch the active timeframe at runtime.
-#   This updates all module-level variables (CANDLE_INTERVAL, BARS_TO_FETCH, etc.)
+# Supported timeframes: 5m, 15m, 1h, 1d
+# Default: 5m (runs every 5 minutes, predicts 15 minutes ahead)
+#
+# call apply_timeframe("15m") to switch at runtime.
 # ============================================================================
 
 import os
 
 # ── Account Settings ─────────────────────────────────────────────────────────
 INITIAL_CAPITAL    = 1_000_000      # Starting paper account in USD
-CURRENCY           = "USD"          # Display currency
+CURRENCY           = "USD"
 
 # ── Signal / Prediction ──────────────────────────────────────────────────────
-BUY_THRESHOLD      = 0.52           # Model prob > 52% → BUY
-SELL_THRESHOLD     = 0.48           # Model prob < 48% → SELL
-                                    # 48%-52% → HOLD (tight band to avoid noise)
+BUY_THRESHOLD      = 0.52           # Model prob > 52% -> BUY
+SELL_THRESHOLD     = 0.48           # Model prob < 48% -> SELL
 
 # ── Execution / Risk ─────────────────────────────────────────────────────────
-COMMISSION_PCT     = 0.0002         # 2 basis points per side (round-trip = 4 bps)
+COMMISSION_PCT     = 0.0002         # 2 basis points per side
 SLIPPAGE_PCT       = 0.0001         # 1 bp slippage per trade
 MAX_POSITION_PCT   = 0.15           # Max 15% of equity in a single trade
-MAX_DAILY_LOSS_PCT = 0.05           # Stop trading if daily loss > 5% of equity
+MAX_DAILY_LOSS_PCT = 0.05           # Stop trading if daily loss > 5%
 
-# ── Regime-Aware Position Sizing (from daily HMM) ────────────────────────────
+# ── Regime-Aware Position Sizing ─────────────────────────────────────────────
 REGIME_MULTIPLIERS = {
     'BULL':   1.00,
     'CHOPPY': 0.60,
     'PANIC':  0.40,
 }
 
-# ── WTI Market / Price Feed — Active Defaults (overridden by apply_timeframe) ─
-TICKER_INTRADAY    = "CL=F"         # WTI Crude Oil Futures
-TICKER_DAILY       = "CL=F"         # WTI Crude Oil Futures (daily, for HMM)
-CANDLE_INTERVAL    = "1m"           # Active candle interval
-BARS_TO_FETCH      = 7              # Days of history to fetch
-BARS_FOR_TRAINING  = 5000           # Approx bars for feature engineering
-PREDICT_HORIZON    = 5              # Predict price direction N bars ahead
-LOOP_INTERVAL_SECS = 60             # Seconds between trading cycles
-MIN_TRAIN_BARS     = 500            # Minimum bars needed before trading
-RETRAIN_EVERY_MINS = 240            # Retrain XGBoost every N minutes
+# ── WTI Ticker ───────────────────────────────────────────────────────────────
+TICKER_INTRADAY    = "CL=F"
+TICKER_DAILY       = "CL=F"
 
-# ── WTI Market Hours (UTC) ───────────────────────────────────────────────────
-MARKET_OPEN_ET     = "18:00"        # 6:00 PM ET Sunday (start of week)
-MARKET_CLOSE_ET    = "17:00"        # 5:00 PM ET (daily close / maintenance)
-MAINTENANCE_START  = "17:00"        # Skip trades between 5:00-6:00 PM ET
-MAINTENANCE_END    = "18:00"        # Resume at 6:00 PM ET
+# ── Active Defaults (overridden by apply_timeframe) ───────────────────────────
+CANDLE_INTERVAL    = "5m"           # Default: 5-minute candles
+BARS_TO_FETCH      = 30
+BARS_FOR_TRAINING  = 2000
+PREDICT_HORIZON    = 3              # 3 bars x 5m = 15 min ahead
+LOOP_INTERVAL_SECS = 300            # Run every 5 minutes
+MIN_TRAIN_BARS     = 150
+RETRAIN_EVERY_MINS = 480
+
+# ── WTI Market Hours ─────────────────────────────────────────────────────────
+MAINTENANCE_START  = "17:00"
+MAINTENANCE_END    = "18:00"
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 BASE_DIR           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,95 +58,74 @@ LOG_PATH           = os.path.join(OUTPUT_DIR, 'paper_trading.log')
 DASHBOARD_PATH     = os.path.join(OUTPUT_DIR, 'paper_dashboard.html')
 
 # ── Web Server ───────────────────────────────────────────────────────────────
-WEB_PORT           = int(os.environ.get('PORT', 8080))  # Railway injects $PORT
-DASHBOARD_REFRESH  = 60             # Dashboard auto-refresh interval in seconds
+WEB_PORT           = int(os.environ.get('PORT', 8080))
+DASHBOARD_REFRESH  = 60
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MULTI-TIMEFRAME CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
-# Each timeframe entry contains the settings that change with the resolution.
+# =============================================================================
+# TIMEFRAME CONFIGURATIONS
+# 1m has been REMOVED. Use 5m as the fastest timeframe.
+# =============================================================================
 #
-# Fields:
-#   interval          — yfinance interval string
-#   bars_to_fetch_days— days of history to request
-#   loop_secs         — seconds between trading cycles
-#   predict_horizon   — N bars ahead to predict direction
-#   min_train_bars    — minimum bars needed to train XGBoost
-#   retrain_mins      — how often to retrain (in minutes)
-#   label             — human-readable label for the dashboard
-#   bars_for_training — approximate bar count for the training window
+#  5m  — runs every 5 min  — predicts 15 min ahead  — great for intraday
+# 15m  — runs every 15 min — predicts 30 min ahead  — less noise, more reliable
+#  1h  — runs every 1 hr   — predicts 2 hrs ahead   — swing-style
+#  1d  — runs once/day     — predicts next day dir   — position trading
 
 TIMEFRAME_CONFIGS = {
-    "1m": {
-        "interval"          : "1m",
-        "bars_to_fetch_days": 7,
-        "loop_secs"         : 60,
-        "predict_horizon"   : 5,
-        "min_train_bars"    : 500,
-        "retrain_mins"      : 240,
-        "bars_for_training" : 5000,
-        "label"             : "1 Minute",
-    },
     "5m": {
         "interval"          : "5m",
-        "bars_to_fetch_days": 30,     # yfinance allows 60d for 5m
+        "bars_to_fetch_days": 30,
         "loop_secs"         : 300,
-        "predict_horizon"   : 3,      # predict 3 × 5m = 15 minutes ahead
+        "predict_horizon"   : 3,       # 3 x 5m = 15 min ahead
         "min_train_bars"    : 150,
-        "retrain_mins"      : 480,    # retrain every 8 hours
+        "retrain_mins"      : 480,     # retrain every 8 hours
         "bars_for_training" : 2000,
-        "label"             : "5 Minutes",
+        "label"             : "5 Min",
+        "description"       : "5 Minutes — trade every 5 min, predict 15 min ahead",
     },
     "15m": {
         "interval"          : "15m",
         "bars_to_fetch_days": 60,
         "loop_secs"         : 900,
-        "predict_horizon"   : 2,      # predict 2 × 15m = 30 minutes ahead
+        "predict_horizon"   : 2,       # 2 x 15m = 30 min ahead
         "min_train_bars"    : 100,
-        "retrain_mins"      : 720,    # retrain every 12 hours
+        "retrain_mins"      : 720,     # retrain every 12 hours
         "bars_for_training" : 1000,
-        "label"             : "15 Minutes",
+        "label"             : "15 Min",
+        "description"       : "15 Minutes — trade every 15 min, predict 30 min ahead",
     },
     "1h": {
         "interval"          : "1h",
-        "bars_to_fetch_days": 180,    # yfinance allows 730d for hourly
+        "bars_to_fetch_days": 180,
         "loop_secs"         : 3600,
-        "predict_horizon"   : 2,      # predict 2 × 1h = 2 hours ahead
+        "predict_horizon"   : 2,       # 2 x 1h = 2 hours ahead
         "min_train_bars"    : 80,
-        "retrain_mins"      : 1440,   # retrain once per day
+        "retrain_mins"      : 1440,    # retrain once per day
         "bars_for_training" : 500,
         "label"             : "1 Hour",
+        "description"       : "1 Hour — trade every hour, predict 2 hours ahead",
     },
     "1d": {
         "interval"          : "1d",
-        "bars_to_fetch_days": 730,    # 2 years of daily bars
-        "loop_secs"         : 86400,  # run once per day
-        "predict_horizon"   : 1,      # predict next day direction
+        "bars_to_fetch_days": 730,
+        "loop_secs"         : 86400,
+        "predict_horizon"   : 1,       # predict next day
         "min_train_bars"    : 80,
-        "retrain_mins"      : 10080,  # retrain weekly
+        "retrain_mins"      : 10080,   # retrain weekly
         "bars_for_training" : 400,
         "label"             : "1 Day",
+        "description"       : "1 Day — trade once daily, predict tomorrow's direction",
     },
 }
 
-# Active timeframe name (set by apply_timeframe)
-ACTIVE_TIMEFRAME = "1m"
+# Active timeframe (set by apply_timeframe)
+ACTIVE_TIMEFRAME = "5m"
 
 
 def apply_timeframe(tf: str) -> None:
     """
     Switch the active trading timeframe at runtime.
-
-    Updates all module-level config variables (CANDLE_INTERVAL, LOOP_INTERVAL_SECS,
-    PREDICT_HORIZON, MIN_TRAIN_BARS, RETRAIN_EVERY_MINS) to match the given timeframe.
-
-    Parameters
-    ----------
-    tf : str — one of '1m', '5m', '15m', '1h', '1d'
-
-    Raises
-    ------
-    ValueError if tf is not in TIMEFRAME_CONFIGS
+    Raises ValueError if tf is not one of: 5m, 15m, 1h, 1d
     """
     if tf not in TIMEFRAME_CONFIGS:
         raise ValueError(
@@ -156,18 +135,24 @@ def apply_timeframe(tf: str) -> None:
     global ACTIVE_TIMEFRAME, CANDLE_INTERVAL, BARS_TO_FETCH, BARS_FOR_TRAINING
     global PREDICT_HORIZON, LOOP_INTERVAL_SECS, MIN_TRAIN_BARS, RETRAIN_EVERY_MINS
 
-    cfg = TIMEFRAME_CONFIGS[tf]
+    c = TIMEFRAME_CONFIGS[tf]
     ACTIVE_TIMEFRAME    = tf
-    CANDLE_INTERVAL     = cfg["interval"]
-    BARS_TO_FETCH       = cfg["bars_to_fetch_days"]
-    BARS_FOR_TRAINING   = cfg["bars_for_training"]
-    PREDICT_HORIZON     = cfg["predict_horizon"]
-    LOOP_INTERVAL_SECS  = cfg["loop_secs"]
-    MIN_TRAIN_BARS      = cfg["min_train_bars"]
-    RETRAIN_EVERY_MINS  = cfg["retrain_mins"]
+    CANDLE_INTERVAL     = c["interval"]
+    BARS_TO_FETCH       = c["bars_to_fetch_days"]
+    BARS_FOR_TRAINING   = c["bars_for_training"]
+    PREDICT_HORIZON     = c["predict_horizon"]
+    LOOP_INTERVAL_SECS  = c["loop_secs"]
+    MIN_TRAIN_BARS      = c["min_train_bars"]
+    RETRAIN_EVERY_MINS  = c["retrain_mins"]
 
 
 def get_timeframe_label(tf: str = None) -> str:
-    """Returns the human-readable label for a timeframe (or the active one)."""
+    """Returns the short label for a timeframe."""
     tf = tf or ACTIVE_TIMEFRAME
     return TIMEFRAME_CONFIGS.get(tf, {}).get("label", tf)
+
+
+def get_timeframe_description(tf: str = None) -> str:
+    """Returns full description for a timeframe."""
+    tf = tf or ACTIVE_TIMEFRAME
+    return TIMEFRAME_CONFIGS.get(tf, {}).get("description", tf)

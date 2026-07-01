@@ -51,12 +51,12 @@ Examples:
   python paper_trading/run_paper_trader.py --reset            # Reset account
         """
     )
-    # Bug #13 fix: timeframe argument
+    # Bug #13 fix: timeframe argument (1m removed — minimum is 5m)
     parser.add_argument(
         '--timeframe', '-tf',
-        default='1m',
+        default='5m',
         choices=list(cfg.TIMEFRAME_CONFIGS.keys()),
-        help='Trading timeframe: 1m (default), 5m, 15m, 1h, 1d'
+        help='Trading timeframe: 5m (default), 15m, 1h, 1d'
     )
     parser.add_argument('--once',      action='store_true', help='Run one cycle and exit')
     parser.add_argument('--dashboard', action='store_true', help='Generate dashboard and exit')

@@ -77,11 +77,11 @@ class PaperTradingEngine:
 
     Parameters
     ----------
-    timeframe : str — '1m', '5m', '15m', '1h', or '1d'
+    timeframe : str — '5m', '15m', '1h', or '1d'  (1m has been removed)
                       Applies config.TIMEFRAME_CONFIGS settings for this timeframe.
     """
 
-    def __init__(self, timeframe: str = '1m'):
+    def __init__(self, timeframe: str = '5m'):
         # Apply the requested timeframe — sets all config module-level vars
         cfg.apply_timeframe(timeframe)
 

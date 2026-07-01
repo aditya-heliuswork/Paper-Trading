@@ -2,8 +2,9 @@
 # PETROQUANT — PAPER TRADING MODULE
 # ============================================================================
 # Intraday paper trading engine for WTI Crude Oil (CL=F)
-# Uses 1-minute candles to predict 5-minute price direction via XGBoost.
+# Uses 5m/15m/1h/1d candles to predict price direction via XGBoost.
 # Hybrid approach: daily HMM regime (macro filter) + intraday XGBoost signal.
+# Minimum timeframe: 5 minutes (1m removed — too noisy for live trading)
 #
 # Folder structure:
 #   config.py            — all settings (capital, slippage, thresholds)
