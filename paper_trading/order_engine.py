@@ -2,15 +2,19 @@
 # PETROQUANT PAPER TRADING — ORDER ENGINE
 # ============================================================================
 # Translates model signals into portfolio actions.
-# Handles: position flipping, duplicate signal suppression, and regime scaling.
+# Handles: position closing, new entries, duplicate signal suppression, and regime scaling.
 #
 # Logic:
 #   BUY signal  + no position  → open LONG
 #   SELL signal + no position  → open SHORT
-#   BUY signal  + SHORT open   → close SHORT, open LONG (flip)
-#   SELL signal + LONG open    → close LONG, open SHORT (flip)
+#   BUY signal  + SHORT open   → close SHORT only, go FLAT (re-enter next bar if signal persists)
+#   SELL signal + LONG open    → close LONG only, go FLAT (re-enter next bar if signal persists)
 #   Same direction as current  → HOLD (don't churn)
 #   HOLD signal                → do nothing
+#
+# Rationale: Immediately flipping from LONG→SHORT (or vice versa) in one bar
+# doubles risk at the worst moment and acts on potentially noisy signals.
+# Closing first and re-evaluating next bar is safer for intraday ML models.
 #
 # OrderEngine:
 #   execute(signal, prob, price, regime, regime_mult) → dict of actions taken
@@ -95,60 +99,78 @@ class OrderEngine:
                 'unrealized'  : unrealized,
             }
 
-        # ── Calculate position size ───────────────────────────────────────────
+        fills = []
+
+        # ── Close existing position (opposite signal) — go FLAT, do NOT flip ─
+        if action in ('CLOSE_LONG', 'CLOSE_SHORT'):
+            close_result = portfolio.close_position(price)
+            if close_result.get('status') == 'closed':
+                fills.append(('CLOSE_' + close_result['side'], close_result))
+                log.log_trade(
+                    timestamp     = bar_time,
+                    action        = f"CLOSE_{close_result['side']}",
+                    signal        = signal,
+                    price         = close_result['fill_price'],
+                    quantity      = close_result['qty'],
+                    commission    = close_result['commission'],
+                    regime        = regime,
+                    probability   = probability,
+                    position_size = regime_mult,
+                    pnl_realized  = close_result['net_pnl'],
+                    pnl_unrealized= 0.0,
+                    cash_balance  = portfolio.cash,
+                    equity        = portfolio.get_equity(price),
+                    notes         = f'Close on opposite signal ({signal}) — going FLAT'
+                )
+                self._last_signal = 'HOLD'  # reset so next bar can open fresh
+
+            snapshot_after = portfolio.get_snapshot(price)
+            log.log_snapshot(bar_time, snapshot_after, regime, signal, probability)
+
+            logger.info(f"[OrderEngine] {action} | price=${price:.4f} | "
+                        f"pnl=${close_result.get('net_pnl', 0):+.2f} | "
+                        f"equity=${snapshot_after['equity']:,.2f} | regime={regime}")
+
+            return {
+                'action'      : action,
+                'fills'       : fills,
+                'signal'      : signal,
+                'probability' : probability,
+                'price'       : price,
+                'regime'      : regime,
+                'equity'      : snapshot_after['equity'],
+                'total_return': snapshot_after['total_return_pct'],
+            }
+
+        # ── Open new position (only when FLAT) ────────────────────────────────
         qty = portfolio.position_size_units(price, regime_mult, probability)
 
         if qty <= 0:
             return {'action': 'HOLD', 'reason': 'zero_qty'}
 
-        fills = []
-
-        # ── Close existing position if flipping ───────────────────────────────
-        if action in ('FLIP_TO_LONG', 'FLIP_TO_SHORT'):
-            close_result = portfolio.close_position(price)
-            if close_result.get('status') == 'closed':
-                fills.append(('CLOSE_' + close_result['side'], close_result))
-                log.log_trade(
-                    timestamp    = bar_time,
-                    action       = f"CLOSE_{close_result['side']}",
-                    signal       = signal,
-                    price        = close_result['fill_price'],
-                    quantity     = close_result['qty'],
-                    commission   = close_result['commission'],
-                    regime       = regime,
-                    probability  = probability,
-                    position_size= regime_mult,
-                    pnl_realized = close_result['net_pnl'],
-                    pnl_unrealized=0.0,
-                    cash_balance = portfolio.cash,
-                    equity       = portfolio.get_equity(price),
-                    notes        = f'Flip: {close_result["side"]} → {"LONG" if action=="FLIP_TO_LONG" else "SHORT"}'
-                )
-
-        # ── Open new position ─────────────────────────────────────────────────
-        if action in ('OPEN_LONG', 'FLIP_TO_LONG'):
+        if action == 'OPEN_LONG':
             open_result = portfolio.open_long(qty, price)
-        else:  # OPEN_SHORT or FLIP_TO_SHORT
+        else:  # OPEN_SHORT
             open_result = portfolio.open_short(qty, price)
 
         if open_result.get('status') == 'filled':
             new_side = open_result['side']
             fills.append((f'OPEN_{new_side}', open_result))
             log.log_trade(
-                timestamp    = bar_time,
-                action       = f"OPEN_{new_side}",
-                signal       = signal,
-                price        = open_result['fill_price'],
-                quantity     = open_result['qty'],
-                commission   = open_result['commission'],
-                regime       = regime,
-                probability  = probability,
-                position_size= regime_mult,
-                pnl_realized = 0.0,
-                pnl_unrealized=0.0,
-                cash_balance = portfolio.cash,
-                equity       = portfolio.get_equity(price),
-                notes        = f'regime={regime} mult={regime_mult}'
+                timestamp     = bar_time,
+                action        = f"OPEN_{new_side}",
+                signal        = signal,
+                price         = open_result['fill_price'],
+                quantity      = open_result['qty'],
+                commission    = open_result['commission'],
+                regime        = regime,
+                probability   = probability,
+                position_size = regime_mult,
+                pnl_realized  = 0.0,
+                pnl_unrealized= 0.0,
+                cash_balance  = portfolio.cash,
+                equity        = portfolio.get_equity(price),
+                notes         = f'regime={regime} mult={regime_mult}'
             )
             self._last_signal = signal
         else:
@@ -180,22 +202,29 @@ class OrderEngine:
         Maps (signal, current_position_side) → action string.
 
         Returns one of:
-          'OPEN_LONG'    — no position, BUY signal
-          'OPEN_SHORT'   — no position, SELL signal
-          'FLIP_TO_LONG' — currently short, BUY signal (close short + open long)
-          'FLIP_TO_SHORT'— currently long, SELL signal (close long + open short)
-          'HOLD'         — same direction or HOLD signal
+          'OPEN_LONG'   — no position, BUY signal  → enter long
+          'OPEN_SHORT'  — no position, SELL signal → enter short
+          'CLOSE_LONG'  — currently long,  SELL signal → close only, go FLAT
+          'CLOSE_SHORT' — currently short, BUY  signal → close only, go FLAT
+          'HOLD'        — same direction as open position, or HOLD signal
+
+        Note: Opposite signals close the position and go FLAT.
+        The next bar re-evaluates cleanly from a flat state.
+        This avoids doubling risk by immediately flipping direction on a single noisy bar.
         """
         if signal == 'HOLD':
             return 'HOLD'
 
         if current_side is None:
+            # No open position — open fresh in signal direction
             return 'OPEN_LONG' if signal == 'BUY' else 'OPEN_SHORT'
 
         if signal == 'BUY' and current_side == 'SHORT':
-            return 'FLIP_TO_LONG'
+            # Opposite signal — close short, go flat (do NOT open long yet)
+            return 'CLOSE_SHORT'
         elif signal == 'SELL' and current_side == 'LONG':
-            return 'FLIP_TO_SHORT'
+            # Opposite signal — close long, go flat (do NOT open short yet)
+            return 'CLOSE_LONG'
         else:
             # Same direction as current position — don't churn
             return 'HOLD'
